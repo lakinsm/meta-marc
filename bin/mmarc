@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+
+## This script performs the screen + optional dedup -> HMMER -> parse + re-inflation of raw reads
+## using the Meta-MARC Colorado State University Microbial Ecology Group HMMs for antimicrobial resistance.
+
+## Author: Steven Lakin (Steven.Lakin@colostate.edu)
+
+
+##########
+## Vars ##
+##########
+dedup=0
+evalue=10
+set=1
+kmer=16
+multi=0
+threads=1
+snp=0
+paired=0
+cov=80
+
+relpath="${BASH_SOURCE%/*}"
+infile=""
+forward=""
+reverse=""
+filename=""
+graph_dir=""
+outdir=""
+skew_file=""
+dup_file=""
+templates="${relpath}/../src/mmarc_groupIII_seqs.fasta"
+annot="${relpath}/../src/mmarc_model_annotations.tsv"
+
+snp_report=""
+snp_fasta=""
+hmmer_fasta=""
+
+shopt -s extglob
+
+
+##########
+## Help ##
+##########
+display_help() {
+    echo "
+        Single-input usage: mmarc [options] -i INPUT -o OUT_DIR -f FILENAME -l MODEL_SET
+        Paired-input usage: mmarc [options] --i1 FORWARD --i2 REVERSE -o OUT_DIR -f FILENAME -l MODEL_SET
+
+            -h | --help		Display this menu
+
+        Main pipeline options:
+			
+			-c | --coverage         Percent coverage over which to count model hits (default 80%), (0,100]
+            -d | --dedup            Flag: run the deduplication pipeline for redundant fastqs
+            -e | --evalue INT       E-value under which to keep HMMER hits (ex. 1e-3) [10]
+            -f | --filename STR     Basename of the output file (no extension or path)
+            -g | --graphs DIR       Directory to output skewness graphs (only use with -w)
+            -i | --input FILE       Input single-end fastq.gz, fastq, or fasta file
+                --i1 FILE           Input forward paired fastq or fastq.gz file (must be used with --i2)
+                --i2 FILE           Input reverse paired fastq or fastq.gz file (must be used with --i1)
+            -k | --kmer INT         K-mer size for the hash-table screen [16], use 0 for no screen
+            -l | --level INT        Level of model to use (1, 2, 3) [1]
+            -m | --multicorrect     Flag: correct for multiple hits (recommended for raw reads)
+            -o | --output DIR       Directory to output files
+            -t | --threads INT      Number of threads to use [1]
+            -w | --skewness FILE    Run the skewness pipeline and output to this file
+
+    "
+}
+
+
+#############
+## Methods ##
+#############
+prescreen() {
+    if [ "$paired" == 0 ]; then   
+    	local input=${1}
+		local database=${2}
+		local outdir=${3}
+		local filename=${4}
+		local kmer=${5}
+		local nprocs=${6}
+		
+		filetype=$( echo "$input" | grep -o -P ".fastq$|.fq$|.gz$|.gzip$" )
+		if [ ! -e "$outdir"/"$filename"_screened.fasta ]; then
+	        if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+                gunzip -c "$input" | "${relpath}"/mmarc_kmerscreen.py -d "$database" -k "$kmer" -n "$threads" > "$outdir"/"$filename"_screened.fasta
+	        elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+               cat "$input" | "${relpath}"/mmarc_kmerscreen.py -d "$database" -k "$kmer" -n "$threads" > "$outdir"/"$filename"_screened.fasta
+	        else
+	            echo -e "\nError in mmarc_kmerscreen.py: Input file extension must be .fq .fastq .gz or .gzip for raw read input\n"
+	            exit 1
+	        fi
+		else
+		    echo -e "\t${outdir}/${filename}_screened.fasta already exists; proceeding..."
+		fi
+	else
+		local forward=${1}
+		local reverse=${2}
+		local filetype=${3}
+		local database=${4}
+		local outdir=${5}
+		local filename=${6}
+		local kmer=${7}
+		local nprocs=${8}
+		
+		if [ ! -e "$outdir"/"$filename"_screened.fasta ]; then
+	        if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+	            gunzip -c "$forward" "$reverse" | "${relpath}"/mmarc_kmerscreen.py -d "$database" -k "$kmer" -n "$threads" > "$outdir"/"$filename"_screened.fasta
+	        elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+	            cat "$forward" "$reverse" | "${relpath}"/mmarc_kmerscreen.py -d "$database" -k "$kmer" -n "$threads" > "$outdir"/"$filename"_screened.fasta
+	        else
+	            echo -e "\nError in mmarc_kmerscreen.py: Input file extension must be .fq .fastq .gz or .gzip for raw read input\n"
+	            exit 1
+	        fi
+		else
+		    echo -e "\t${outdir}/${filename}_screened.fasta already exists; proceeding..."
+		fi
+	fi
+}
+
+
+mmarc_hmmer() {
+    local input=${1}
+    local filename=${2}
+    local outdir=${3}
+    local model=${4}
+    local threads=${5}
+    
+    if [ ! -e "$outdir"/"$filename".tblout.scan ]; then
+        if [ -L "${relpath}"/nhmmer ]; then
+            "${relpath}"/nhmmer --dna --notextw --cpu "$threads" --tblout "$outdir"/"$filename".tblout.scan "$model" "$input" > /dev/null
+        else
+            nhmmer --dna --notextw --cpu "$threads" --tblout "$outdir"/"$filename".tblout.scan "$model" "$input" > /dev/null || echo -e "\nError: cannot locate hmmer binaries, please rebuild or install hmmer separately"
+        fi
+    else
+        echo -e "\t${outdir}/${filename}.tblout.scan already exists; proceeding..."
+    fi
+}
+
+
+parse_tblout() {
+    local input=${1}
+    local outdir=${2}
+    local filename=${3}
+    local annot=${4}
+    local model_set=${5}
+    local evalue=${6}
+    local multi=${7}
+    local skew_file=${8}
+    local graph_dir=${9}
+    local dup_file=${10}
+    
+    if [ ! -e "$outdir"/"$filename"_parsed.csv ]; then
+        if [ "$multi" != 0 ]; then
+            if [ ! "$dup_file" == "" ]; then
+                if [ ! "$skew_file" == "" ] && [ ! "$graph_dir" == "" ]; then
+                	if [ "$snp" != 0 ]; then
+                		if [ ! "$snp_report" == "" ]; then
+                			if [ ! "$snp_fasta" == "" ]; then
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -g "$graph_dir" -m --snp --snp_report "$snp_report" --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			else
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -g "$graph_dir" -m --snp --snp_report "$snp_report" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			fi
+                		elif [ ! "$snp_fasta" == "" ];then
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -g "$graph_dir" -m --snp --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		else
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -g "$graph_dir" -m --snp - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		fi
+                	else
+                		cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -g "$graph_dir" -m - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                	fi
+                	
+                	
+                elif [ ! "$skew_file" == "" ] && [ "$graph_dir" == "" ]; then
+                	if [ "$snp" != 0 ]; then
+                		if [ ! "$snp_report" == "" ]; then
+                			if [ ! "$snp_fasta" == "" ]; then
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -m --snp --snp_report "$snp_report" --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			else
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -m --snp --snp_report "$snp_report" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			fi
+                		elif [ ! "$snp_fasta" == "" ];then
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -m --snp --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		else
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -m --snp - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		fi
+                	else
+                		cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -s "$skew_file" -m - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                	fi
+                else
+                	if [ "$snp" != 0 ]; then
+                		if [ ! "$snp_report" == "" ]; then
+                			if [ ! "$snp_fasta" == "" ]; then
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -m --snp --snp_report "$snp_report" --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			else
+                				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -m --snp --snp_report "$snp_report" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                			fi
+                		elif [ ! "$snp_fasta" == "" ];then
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -m --snp --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		else
+                			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -m --snp - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                		fi
+                	else
+                		cat "$input" | "${relpath}"/mmparse.py -c "$cov" -d "$dup_file" -e "$evalue" -m - "$outdir" "$filename"_parsed "$annot" "$model_set"
+                	fi
+                fi
+            else
+            	if [ "$snp" != 0 ]; then
+            		if [ ! "$snp_report" == "" ]; then
+            			if [ ! "$snp_fasta" == "" ]; then
+            				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" -m --snp --snp_report "$snp_report" --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            			else
+            				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" -m --snp --snp_report "$snp_report" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            			fi
+            		elif [ ! "$snp_fasta" == "" ];then
+            			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" -m --snp --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            		else
+            			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" -m --snp - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            		fi
+            	else
+            		cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" -m - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            	fi
+            fi
+        else
+        	if [ "$snp" != 0 ]; then
+            		if [ ! "$snp_report" == "" ]; then
+            			if [ ! "$snp_fasta" == "" ]; then
+            				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" --snp --snp_report "$snp_report" --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            			else
+            				cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" --snp --snp_report "$snp_report" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            			fi
+            		elif [ ! "$snp_fasta" == "" ];then
+            			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" --snp --snp_fasta_out "$snp_fasta" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            		else
+            			cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" --snp - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            		fi
+            	else
+            		cat "$input" | "${relpath}"/mmparse.py -c "$cov" -e "$evalue" - "$outdir" "$filename"_parsed "$annot" "$model_set"
+            	fi
+        fi
+    else
+        echo -e "\t${outdir}/${filename}_parsed.csv already exists; proceeding..."
+    fi
+}
+
+
+##########
+## Main ##
+##########
+while [[ "${1+defined}" ]]; do
+    case "$1" in
+        -c | --coverage)
+            cov=$2
+            shift 2
+            ;;
+        -d | --dedup )
+            dedup=1
+            shift 1
+            ;;
+        -e | --evalue )
+            evalue=$2
+            shift 2
+            ;;
+        -f | --filename )
+            filename=$2
+            shift 2
+            ;;
+        -g | --graphs )
+            graph_dir=$2
+            shift 2
+            ;;
+        -h | --help )
+            display_help
+            exit 0
+            ;;
+        -i | --input )
+            infile=$2
+            shift 2
+            ;;
+        --i1 )
+            forward=$2
+            shift 2
+            ;;
+        --i2 )
+        	reverse=$2
+        	shift 2
+        	;;
+        -k | --kmer )
+            kmer=$2
+            shift 2
+            ;;
+        -l | --level )
+            set=$2
+            shift 2
+            ;;
+        -m | --multicorrect )
+            multi=1
+            shift 1
+            ;;
+        -o | --output )
+            outdir=$2
+            shift 2
+            ;;
+        -t | --threads )
+            threads=$2
+            shift 2
+            ;;
+        -w | --skewness )
+            skew_file=$2
+            shift 2
+            ;;
+        --)  # End of options
+            shift 1
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option $1" >&2
+            exit 1
+            ;;
+        *)  # No more options
+            break
+            ;;
+    esac
+done
+
+
+if [ ! "$infile" == "" ]; then
+	if [ ! "$forward" == "" ] || [ ! "$reverse" == "" ]; then
+		echo -e "\nError: Input must either be single-end with --input or paired-end with --i1 and --i2.\n"
+		exit 1
+	fi
+	if [ ! -e "$infile" ]; then
+		echo -e "\nError: Input file "$infile" does not exist.\n"
+		exit 1
+	fi
+elif [ ! "$forward" == "" ] && [ "$reverse" == "" ]; then
+	echo -e "\nError: If paired input, both paired files (--i1 and --i2) must be defined.\n"
+	exit 1
+elif [ "$forward" == "" ] && [ ! "$reverse" == "" ]; then
+	echo -e "\nError: If paired input, both paired files (--i1 and --i2) must be defined.\n"
+	exit 1
+elif [ ! "$forward" == "" ] && [ ! "$reverse" == "" ]; then
+	if [ ! -f "$forward" ] || [ ! -f "$reverse" ]; then
+		echo -e "\nError: Either "$forward" or "$reverse" does not exist.\n"
+		exit 1
+	fi
+	paired=1
+	filetype=$( echo "$forward" | grep -o -P ".fastq$|.fq$|.gz$|.gzip$|.fasta$|.fa$|.faa$" )
+fi
+
+
+if [ "$outdir" == "" ]; then
+	echo -e "\nError: Output not defined.  Define an output directory using the -o option.\n"
+	exit 1
+elif [ ! -d "$outdir" ]; then
+	echo -e "\nError: Output "$outdir" is not a directory.  See documentation or -h for details.\n"
+	exit 1
+fi
+
+if [ "$filename" == "" ]; then
+	echo -e "\nError: Filename output not defined.  Use the -f option to define an output filename.\n"
+	exit 1
+fi
+
+if [ "$set" == 1 ]; then
+    model="${relpath}/../src/HMMs/mmarc_groupI.hmm"
+    if [ "$snp" != 0 ]; then
+    	echo -e "\nError: To use SNP search pipeline, model set (level) 2 or 3 must be used.\n"
+    	exit 1
+    fi
+elif [ "$set" == 2 ]; then
+	model="${relpath}/../src/HMMs/mmarc_groupII.hmm"
+elif [ "$set" == 3 ]; then
+    model="${relpath}/../src/HMMs/mmarc_groupIII.hmm"
+else
+	echo -e "\nError: choice of model must be 1, 2, or 3.  See the online documentation for details.\n"
+	exit 1
+fi
+
+if [ ! "$graph_dir" == "" ] && [ "$skew_file" == "" ]; then
+	echo -e "\nError: If graph output directory is defined, then a skewfile must also be defined with the -w option.\n"
+	exit 1
+elif [ "$graph_dir" == "" ] && [ ! "$skew_file" == "" ]; then
+	echo -e "\nError: If a skewfile is defined, then a graph output directory must also be defined with the -g option.\n"
+	exit 1
+fi
+
+if [ "$snp" == 0 ]; then
+	if [ ! "$snp_report" == "" ] || [ ! "$snp_fasta" == "" ]; then
+		echo -e "\nError: --snp option must be enabled for --snp_report or --snp_fasta_out.\n"
+		exit 1
+	fi
+fi
+
+if [ "$threads" -lt "1" ]; then
+	echo -e "\nError: Number of threads used must be greater than 1.\n"
+	exit 1
+fi
+
+if [ "$kmer" -lt "0" ]; then
+	echo -e "\nError: K-mer size must be between 0 and 35.\n"
+	exit 1
+elif [ "$kmer" -gt "35" ]; then
+	echo -e "\nError: K-mer size must be between 0 and 35.\n"
+	exit 1
+fi
+
+if [ ! "$dedup" == "" ] && [ ! -d "$outdir"/duplicate_tables ]; then
+	mkdir "$outdir"/duplicate_tables
+fi
+
+echo -e "Begin pipeline for sample ${filename}"
+
+if [ "$kmer" != 0 ]; then
+	echo -e "\tBeginning k-mer screen..."
+	if [ ! "$infile" == "" ]; then
+    	prescreen "$infile" "$templates" "$outdir" "$filename" "$kmer" "$threads"
+    elif [ "$paired" != 0 ]; then
+    	prescreen "$forward" "$reverse" "$filetype" "$templates" "$outdir" "$filename" "$kmer" "$threads"
+    fi
+    echo -e "\tdone."
+    if [ "$dedup" != 0 ]; then
+        if [ ! -e "$outdir"/"$filename"_dedup.fasta ]; then
+        	echo -e -n "\tHashing duplicate reads..."
+            grep -v "^>" "$outdir"/"$filename"_screened.fasta | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+            awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+            echo -e "\tdone."
+        fi
+        dup_file="$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+        hmmer_in="$outdir"/"$filename"_dedup.fasta
+    else
+        hmmer_in="$outdir"/"$filename"_screened.fasta
+    fi
+else
+	if [ "$paired" == 0 ]; then
+		filetype=$( echo "$infile" | grep -o -P ".fastq$|.fq$|.gz$|.gzip$|.fasta$|.fa$|.faa$" )
+		if [ "$dedup" != 0 ]; then
+			if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				gunzip -c "$infile" | grep -A 1 "^@" | grep -v "\-\-" | grep -v "^@" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+				echo -e "\tdone."
+				dup_file="$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				hmmer_in="$outdir"/"$filename"_dedup.fasta
+			elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				grep -A 1 "^@" "$infile" | grep -v "\-\-" | grep -v "^@" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+				echo -e "\tdone."
+				dup_file="$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				hmmer_in="$outdir"/"$filename"_dedup.fasta
+			elif [ "$filetype" == ".fasta" ] || [ "$filetype" == ".fa" ] || [ "$filetype" == ".faa" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				cat "$infile" | grep -v "^>" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+		        awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+		        echo -e "\tdone."
+		        hmmer_in="$outdir"/"$filename"_dedup.fasta
+		    else
+		    	echo -e "\nError: Input file extension must be .fa .faa .fasta .fq .fastq .gz or .gzip for raw read input\n"
+		        exit 1
+		    fi
+		else
+			if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+				echo -e -n "\tWriting input to intermediate FASTA file..."
+				gunzip -c "$infile" | grep -A 1 "^@" | grep -v "\-\-" | sed 's/^@/>/' > "$outdir"/"$filename".fasta
+				echo -e "\tdone."
+				hmmer_in="$outdir"/"$filename".fasta
+			elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+				echo -e -n "\tWriting input to intermediate FASTA file..."
+				grep -A 1 "^@" "$infile" | grep -v "\-\-" | sed 's/^@/>/' > "$outdir"/"$filename".fasta
+				echo -e "\tdone."
+				hmmer_in="$outdir"/"$filename".fasta
+			elif [ "$filetype" == ".fasta" ] || [ "$filetype" == ".fa" ] || [ "$filetype" == ".faa" ]; then
+		        hmmer_in="$infile"
+		    else
+		    	echo -e "\nError: Input file extension must be .fa .faa .fasta .fq .fastq .gz or .gzip\n"
+		        exit 1
+		    fi
+		fi
+	else
+		if [ "$dedup" != 0 ]; then
+			if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				gunzip -c "$forward" "$reverse" | grep -A 1 "^@" | grep -v "\-\-" | grep -v "^@" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+				echo -e "\tdone."
+				dup_file="$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				hmmer_in="$outdir"/"$filename"_dedup.fasta
+			elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				cat "$forward" "$reverse" | grep -A 1 "^@" | grep -v "\-\-" | grep -v "^@" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+				echo -e "\tdone."
+				dup_file="$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+				hmmer_in="$outdir"/"$filename"_dedup.fasta
+			elif [ "$filetype" == ".fasta" ] || [ "$filetype" == ".fa" ] || [ "$filetype" == ".faa" ]; then
+				echo -e -n "\tHashing duplicate reads..."
+				cat "$forward" "$reverse" | grep -v "^>" | sort | uniq -c > "$outdir"/duplicate_tables/"$filename"_dupcounts.txt
+		        awk 'BEGIN {FS = " "}{print ">"$2"\n"$2}' "$outdir"/duplicate_tables/"$filename"_dupcounts.txt > "$outdir"/"$filename"_dedup.fasta
+		        echo -e "\tdone."
+		    else
+		    	echo -e "\nError: Input file extension must be .fa .faa .fasta .fq .fastq .gz or .gzip for raw read input\n"
+		        exit 1
+		    fi
+		else
+			if [ "$filetype" == ".gz" ] || [ "$filetype" == ".gzip" ]; then
+				echo -e -n "\tWriting input to intermediate FASTA file..."
+				gunzip -c "$forward" "$reverse" | grep -A 1 "^@" | grep -v "\-\-" | sed 's/^@/>/' > "$outdir"/"$filename".fasta
+				echo -e "\tdone."
+				hmmer_in="$outdir"/"$filename".fasta
+			elif [ "$filetype" == ".fastq" ] || [ "$filetype" == ".fq" ]; then
+				echo -e -n "\tWriting input to intermediate FASTA file..."
+				cat "$forward" "$reverse" | grep -A 1 "^@" | grep -v "\-\-" | sed 's/^@/>/' > "$outdir"/"$filename".fasta
+				echo -e "\tdone."
+				hmmer_in="$outdir"/"$filename".fasta
+			elif [ "$filetype" == ".fasta" ] || [ "$filetype" == ".fa" ] || [ "$filetype" == ".faa" ]; then
+		        echo -e "\nError: Paired end files that are in fasta format should be concatenated prior to running mmarc.\n"
+		        exit 1
+		    else
+		    	echo -e "\nError: Input file extension must be .fa .faa .fasta .fq .fastq .gz or .gzip\n"
+		        exit 1
+		    fi
+		fi
+	fi
+fi
+
+echo -e -n "\tScanning with nhmmer search..."
+mmarc_hmmer "$hmmer_in" "$filename" "$outdir" "$model" "$threads"
+echo -e "\tdone."
+
+echo -e "\tParsing tblout file..."
+parse_tblout "$outdir"/"$filename".tblout.scan "$outdir" "$filename" "$annot" "$set" "$evalue" "$multi" "$skew_file" "$graph_dir" "$dup_file"
+echo -e "\tdone."
+
+echo -e "\nPipeline complete for sample ${filename}, analytic data written to ${outdir}/${filename}_parsed.csv"
+
+exit 0
+
