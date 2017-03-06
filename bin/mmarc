@@ -12,7 +12,7 @@
 dedup=0
 evalue=10
 set=1
-kmer=16
+kmer=0
 multi=0
 threads=1
 snp=0
@@ -58,7 +58,7 @@ display_help() {
             -i | --input FILE       Input single-end fastq.gz, fastq, or fasta file
                 --i1 FILE           Input forward paired fastq or fastq.gz file (must be used with --i2)
                 --i2 FILE           Input reverse paired fastq or fastq.gz file (must be used with --i1)
-            -k | --kmer INT         K-mer size for the hash-table screen [16], use 0 for no screen
+            -k | --kmer INT         K-mer size for the hash-table screen [0], use 0 for no screen
             -l | --level INT        Level of model to use (1, 2, 3) [1]
             -m | --multicorrect     Flag: correct for multiple hits (recommended for raw reads)
             -o | --output DIR       Directory to output files
